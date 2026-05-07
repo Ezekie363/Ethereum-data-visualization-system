@@ -18,6 +18,9 @@
 该实现偏学术展示风格，适合毕业论文的系统实现章节与结果展示章节直接引用。
 
 ---
+🔗可视化页面：https://ezekie363.github.io/Ethereum-data-visualization-system/thesis-dashboard.html
+
+---
 
 ## 2. 设计目标与约束
 
