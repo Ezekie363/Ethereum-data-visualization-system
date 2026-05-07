@@ -1,0 +1,2 @@
+network,days,generated_at,method,notes
+ethereum,90,2026-04-22T08:16:11.912058+00:00,etherscan_public_csv_download,核心指标来自 Etherscan 公开 CSV；whale 与 amount_distribution 为基于公开统计序列与富豪榜快照的离线代理估计

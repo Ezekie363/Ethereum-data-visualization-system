@@ -1,0 +1,7 @@
+network,bucket,transaction_count
+ethereum,0-0.1,1129412
+ethereum,0.1-1,462194
+ethereum,1-10,213718
+ethereum,10-100,117018
+ethereum,100-1k,40136
+ethereum,>1k,25042

@@ -1,0 +1,21 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.venv/
+venv/
+env/
+
+# Node / frontend build output
+node_modules/
+dist/
+build/
+
+# Logs and local environment
+*.log
+.env
+.env.*
+!.env.example
