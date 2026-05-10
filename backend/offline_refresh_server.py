@@ -3,6 +3,7 @@
 提供接口：
 1) GET  /api/v1/offline/health
 2) POST /api/v1/offline/refresh-csv
+3) GET  /api/v1/etherscan/realtime
 """
 
 from __future__ import annotations
@@ -25,6 +26,31 @@ EXPORT_SCRIPT = BACKEND_DIR / "export_offline_csv.py"
 DATA_ROOT = PROJECT_ROOT / "dashboard" / "data"
 
 RUN_LOCK = threading.Lock()
+
+# ── 实时 API 服务（延迟初始化单例） ──────────────────────────────────────────
+try:
+    from etherscan_api_service import EtherscanApiService as _EtherscanApiService
+    _ETHERSCAN_IMPORT_OK = True
+except ImportError:
+    _ETHERSCAN_IMPORT_OK = False
+
+_etherscan_service = None
+_etherscan_lock = threading.Lock()
+
+
+def _get_etherscan_service():
+    """延迟初始化 EtherscanApiService 单例，首次调用时读取环境变量。"""
+
+    global _etherscan_service
+    if _etherscan_service is not None:
+        return _etherscan_service
+    with _etherscan_lock:
+        if _etherscan_service is None:
+            if not _ETHERSCAN_IMPORT_OK:
+                raise RuntimeError("etherscan_api_service 模块导入失败，请检查依赖")
+            api_key = os.getenv("ETHERSCAN_API_KEY", "").strip() or None
+            _etherscan_service = _EtherscanApiService(api_key=api_key)
+    return _etherscan_service
 
 
 def read_window_meta(network: str, windows: List[int]) -> Dict[str, str]:
@@ -107,10 +133,28 @@ class OfflineRefreshHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
-        """提供健康检查接口。"""
+        """提供健康检查与实时快照接口。"""
 
         if self.path.startswith("/api/v1/offline/health"):
             self._send_json({"status": "ok", "service": "offline_refresh"}, 200)
+            return
+
+        if self.path.startswith("/api/v1/etherscan/realtime"):
+            try:
+                service = _get_etherscan_service()
+                snapshot = service.fetch_realtime_snapshot(network="ethereum")
+                self._send_json(snapshot, 200)
+            except Exception as error:  # noqa: BLE001
+                self._send_json(
+                    {
+                        "error": "FETCH_FAILED",
+                        "message": str(error),
+                        "gasOracle": None,
+                        "latestBlock": None,
+                        "ethSupplyEth": None,
+                    },
+                    502,
+                )
             return
 
         self._send_json({"error": "NOT_FOUND", "message": "API route not found"}, 404)

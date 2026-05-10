@@ -541,3 +541,54 @@ tbody tr:nth-child(odd) {
     height: 245px;
   }
 }
+
+/* ─── 实时 API 模式：LIVE 徽标 ────────────────────────────────────────────── */
+.live-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(34, 197, 94, 0.15);
+  border: 1px solid rgba(34, 197, 94, 0.5);
+  color: #5fe28b;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-left: 8px;
+  vertical-align: middle;
+  line-height: 1;
+}
+
+.live-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #22c55e;
+  flex-shrink: 0;
+  animation: live-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.35; transform: scale(0.75); }
+}
+
+/* ─── 实时 API 模式：数据源徽标 ──────────────────────────────────────────── */
+.data-source-badge.api {
+  border-color: rgba(34, 197, 94, 0.7);
+  background: rgba(34, 197, 94, 0.14);
+  color: #a7f3c8;
+}
+
+/* ─── 实时 API 模式：KPI 卡片高亮（仅 Gas 卡片获得此 class） ──────────────── */
+.kpi-card.realtime-active {
+  border-color: rgba(34, 197, 94, 0.45);
+  background: linear-gradient(
+    160deg,
+    rgba(22, 42, 33, 0.95),
+    rgba(15, 22, 30, 0.95)
+  );
+}

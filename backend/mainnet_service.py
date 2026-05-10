@@ -42,8 +42,8 @@ class EthereumMainnetService:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_ttl_seconds = cache_ttl_seconds
 
-        self.sample_blocks_per_day = int(os.getenv("SAMPLE_BLOCKS_PER_DAY", "84"))
-        self.erc20_log_sample_per_day = int(os.getenv("ERC20_LOG_SAMPLE_PER_DAY", "24"))
+        self.sample_blocks_per_day = int(os.getenv("SAMPLE_BLOCKS_PER_DAY", "12"))
+        self.erc20_log_sample_per_day = int(os.getenv("ERC20_LOG_SAMPLE_PER_DAY", "2"))
         self.whale_tx_threshold_eth = float(os.getenv("WHALE_TX_THRESHOLD_ETH", "500"))
         self.max_retry = int(os.getenv("RPC_RETRY", "3"))
 
@@ -148,20 +148,40 @@ class EthereumMainnetService:
         return windows
 
     def _resolve_boundaries(self, windows: List[DayWindow], latest_block: int) -> List[int]:
-        """将每天起始时间戳映射到对应区块号，供后续抽样使用。"""
+        """将每天起始时间戳映射到区块号。
 
-        boundaries: List[int] = []
-        left = 0
-        right = latest_block
+        只对窗口起始做一次精确二分，其余边界用线性插值估算，将 RPC 调用从
+        O(days × log N) 降为 O(log N)。
+        """
 
-        for window in windows:
-            block_number = self._find_first_block_ge_timestamp(window.start_ts, left, right)
-            boundaries.append(block_number)
-            left = max(0, block_number - 2)
+        if not windows:
+            return []
 
-        final_boundary = self._find_first_block_ge_timestamp(windows[-1].end_ts, boundaries[-1], latest_block)
-        boundaries.append(final_boundary)
+        latest_block_data = self._safe_get_block(latest_block, full_transactions=False)
+        now_ts = int(latest_block_data["timestamp"])
 
+        # 估算窗口起始区块，以避免二分范围过宽
+        first_ts = windows[0].start_ts
+        approx_offset = int((now_ts - first_ts) / 12)
+        search_low = max(0, latest_block - approx_offset - 2000)
+        search_high = min(latest_block, latest_block - approx_offset + 2000)
+
+        anchor_block = self._find_first_block_ge_timestamp(first_ts, search_low, search_high)
+        anchor_data = self._safe_get_block(anchor_block, full_transactions=False)
+        anchor_ts = int(anchor_data["timestamp"])
+
+        # 计算平均出块时间（秒/块）
+        elapsed_blocks = max(1, latest_block - anchor_block)
+        elapsed_seconds = max(1, now_ts - anchor_ts)
+        seconds_per_block = elapsed_seconds / elapsed_blocks
+
+        def ts_to_block(target_ts: int) -> int:
+            offset = (target_ts - anchor_ts) / seconds_per_block
+            estimated = anchor_block + int(offset)
+            return max(0, min(latest_block, estimated))
+
+        boundaries = [ts_to_block(w.start_ts) for w in windows]
+        boundaries.append(ts_to_block(windows[-1].end_ts))
         return boundaries
 
     def _find_first_block_ge_timestamp(self, target_ts: int, left: int, right: int) -> int:
@@ -319,15 +339,9 @@ class EthereumMainnetService:
             "avgTxAmountEth": round(avg_tx_amount, 4),
         }
 
-        scaled_whale_map = {
-            address: {
-                "inflow": flow_data["inflow"] * scale_ratio,
-                "outflow": flow_data["outflow"] * scale_ratio,
-            }
-            for address, flow_data in whale_flow_map.items()
-        }
-
-        return daily_record, scaled_whale_map, estimated_distribution
+        # 巨鲸流量不做 scale_ratio 放大——每笔大额交易是真实发生的单次事件，
+        # 按抽样比例线性外推会严重虚高（单笔 1000 ETH × 600 = 60 万 ETH）。
+        return daily_record, whale_flow_map, estimated_distribution
 
     def _estimate_erc20_transfer_count(
         self,
@@ -379,7 +393,10 @@ class EthereumMainnetService:
         return int(max(0, round(estimated_logs)))
 
     def _estimate_whale_netflow(self, whale_flow_map: Dict[str, Dict[str, float]], scale_ratio: float) -> float:
-        """估计单日巨鲸净流入值，按高金额地址流量进行聚合。"""
+        """估计单日巨鲸净流入值，按高金额地址流量进行聚合。
+
+        不乘以 scale_ratio：鲸鱼大额交易是稀有单次事件，线性外推会导致严重虚高。
+        """
 
         netflow = 0.0
         min_whale_address_flow = self.whale_tx_threshold_eth * 1.6
@@ -391,7 +408,7 @@ class EthereumMainnetService:
                 continue
             netflow += (inflow - outflow)
 
-        return netflow * scale_ratio
+        return netflow
 
     def _bucket_tx_value(self, value_eth: float) -> str:
         """按论文常见分箱划分交易金额区间。"""

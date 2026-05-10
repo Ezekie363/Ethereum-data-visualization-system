@@ -13,7 +13,16 @@ const APP_CONFIG = {
     daily: "daily_metrics.csv",
     distribution: "amount_distribution.csv",
     whale: "whale_ranking.csv"
-  }
+  },
+  defaultDataMode: "csv",
+  realtimeApiPath: "/api/v1/etherscan/realtime",
+  realtimeApiPort: 5001,
+  realtimeAutoRefreshMs: 60000,
+  realtimeRequestTimeoutMs: 8000,
+  rpcApiPort: 5000,
+  rpcApiPath: "/api/v1/dashboard/summary",
+  rpcAutoRefreshMs: 900000,
+  rpcRequestTimeoutMs: 180000
 };
 
 const SCRIPT_BASE_URL = (function () {
@@ -126,7 +135,22 @@ const TRANSLATIONS = {
     series_whale: "巨鲸净流入",
     series_distribution: "交易笔数",
     pie_inflow: "流入总量",
-    pie_outflow: "流出总量"
+    pie_outflow: "流出总量",
+    label_datasource: "数据源",
+    datasource_csv: "离线 CSV",
+    datasource_api: "实时 API（混合）",
+    kpi_realtime_gas: "当前 Gas 价格（实时）",
+    kpi_realtime_gas_range: "安全 {safe} · 快速 {fast} Gwei",
+    source_realtime: "实时 API",
+    badge_realtime: "当前来源：实时 API",
+    toast_realtime_success: "实时 API 快照已获取",
+    toast_realtime_failed: "实时 API 获取失败：{message}",
+    header_realtime_error: "实时数据异常：{message}",
+    realtime_api_unavailable: "实时 API 不可用，Gas 数据将显示 CSV 均值。",
+    button_refresh_loading_rpc: "正在从主网抓取数据...",
+    rpc_loading_hint: "首次加载约需 30–90 秒，后续从缓存读取",
+    source_rpc: "主网 RPC（实时）",
+    rpc_api_unavailable: "实时 RPC 服务不可用，请确认已携带 ETH_RPC_URL 启动服务。"
   },
   en: {
     brand_tag: "BLOCKCHAIN ANALYTICS",
@@ -230,7 +254,22 @@ const TRANSLATIONS = {
     series_whale: "Whale Netflow",
     series_distribution: "Transactions",
     pie_inflow: "Total Inflow",
-    pie_outflow: "Total Outflow"
+    pie_outflow: "Total Outflow",
+    label_datasource: "Data Source",
+    datasource_csv: "Offline CSV",
+    datasource_api: "Realtime API (hybrid)",
+    kpi_realtime_gas: "Current Gas Price (Live)",
+    kpi_realtime_gas_range: "Safe {safe} · Fast {fast} Gwei",
+    source_realtime: "Realtime API",
+    badge_realtime: "Current Source: Realtime API",
+    toast_realtime_success: "Realtime API snapshot fetched",
+    toast_realtime_failed: "Realtime API fetch failed: {message}",
+    header_realtime_error: "Realtime data error: {message}",
+    realtime_api_unavailable: "Realtime API unavailable; Gas will show CSV mean.",
+    button_refresh_loading_rpc: "Fetching from mainnet...",
+    rpc_loading_hint: "First load takes ~30–90s, subsequent loads use cache",
+    source_rpc: "Mainnet RPC (Live)",
+    rpc_api_unavailable: "Realtime RPC service unavailable. Make sure ETH_RPC_URL is set when starting the service."
   }
 };
 
@@ -241,7 +280,11 @@ const appState = {
   dataset: null,
   dataSource: "csv",
   lastUpdated: null,
-  lastError: ""
+  lastError: "",
+  dataMode: APP_CONFIG.defaultDataMode,
+  realtimeSnapshot: null,
+  realtimeError: "",
+  _autoRefreshTimer: null
 };
 
 const chartInstances = {
@@ -645,6 +688,238 @@ function buildOfflineRefreshApiCandidates() {
   return candidates;
 }
 
+/** 构建实时 API 候选地址，与 buildOfflineRefreshApiCandidates 完全对称。 */
+function buildRealtimeApiCandidates() {
+  const candidates = [];
+  const path = APP_CONFIG.realtimeApiPath;
+  const host = window.location.hostname || "127.0.0.1";
+  const fallbackUrl = "http://" + host + ":" + String(APP_CONFIG.realtimeApiPort) + path;
+  candidates.push(fallbackUrl);
+
+  const currentPort = window.location.port || "";
+  if (currentPort !== "8080") {
+    const sameOriginUrl = new URL(path, window.location.origin).toString();
+    if (sameOriginUrl !== fallbackUrl) {
+      candidates.push(sameOriginUrl);
+    }
+  }
+
+  return candidates;
+}
+
+/** 构建 Flask RPC API 候选地址（端口 5000）。 */
+function buildRpcApiCandidates(days, network) {
+  const basePath = APP_CONFIG.rpcApiPath + "?network=" + network + "&days=" + String(days);
+  const host = window.location.hostname || "127.0.0.1";
+  return ["http://" + host + ":" + String(APP_CONFIG.rpcApiPort) + basePath];
+}
+
+/** 将 Flask API 返回数据归一化为前端通用格式（字段名已一致，只重建 overview）。 */
+function normalizeApiDataset(apiResponse) {
+  const daily = Array.isArray(apiResponse.daily) ? apiResponse.daily : [];
+  const whaleRanking = Array.isArray(apiResponse.whaleRanking) ? apiResponse.whaleRanking : [];
+  const amountDistribution = Array.isArray(apiResponse.amountDistribution)
+    ? apiResponse.amountDistribution
+    : [];
+  return {
+    meta: {
+      source: "api",
+      network: (apiResponse.meta && apiResponse.meta.network) || "ethereum",
+      days: (apiResponse.meta && apiResponse.meta.days) || appState.rangeDays,
+      generatedAt: (apiResponse.meta && apiResponse.meta.generatedAt) || new Date().toISOString()
+    },
+    overview: calculateOverviewMetrics(daily, whaleRanking),
+    daily: daily,
+    amountDistribution: amountDistribution,
+    whaleRanking: whaleRanking
+  };
+}
+
+/** 从 Flask RPC 服务加载全量实时数据集，返回 {dataset, source, error}。 */
+async function loadApiDataset() {
+  const candidates = buildRpcApiCandidates(appState.rangeDays, appState.network);
+  const errors = [];
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    const url = candidates[index];
+    const controller = new AbortController();
+    const timer = window.setTimeout(function () {
+      controller.abort();
+    }, APP_CONFIG.rpcRequestTimeoutMs);
+    try {
+      const response = await fetch(url, {
+        method: "GET",
+        cache: "no-store",
+        signal: controller.signal
+      });
+      window.clearTimeout(timer);
+      if (!response.ok) {
+        const body = await response.json().catch(function () { return {}; });
+        errors.push(url + " -> HTTP " + response.status + " " + (body.message || ""));
+        continue;
+      }
+      const data = await response.json();
+      return { dataset: normalizeApiDataset(data), source: "api", error: "" };
+    } catch (error) {
+      window.clearTimeout(timer);
+      errors.push(url + " -> " + (error && error.message ? error.message : "failed"));
+    }
+  }
+
+  throw new Error(t("rpc_api_unavailable") + " " + errors.join(" | "));
+}
+
+/** 向后端获取 Etherscan 实时快照，遍历候选 URL 首个成功即返回。 */
+async function fetchRealtimeSnapshot() {
+  const candidates = buildRealtimeApiCandidates();
+  const errors = [];
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    const url = candidates[index];
+    const controller = new AbortController();
+    const timer = window.setTimeout(function () {
+      controller.abort();
+    }, APP_CONFIG.realtimeRequestTimeoutMs);
+    try {
+      const response = await fetch(url, {
+        method: "GET",
+        cache: "no-store",
+        signal: controller.signal
+      });
+      window.clearTimeout(timer);
+      if (!response.ok) {
+        errors.push(url + " -> HTTP " + response.status);
+        continue;
+      }
+      return await response.json();
+    } catch (error) {
+      window.clearTimeout(timer);
+      errors.push(url + " -> " + (error && error.message ? error.message : "failed"));
+    }
+  }
+
+  throw new Error(errors.join(" | "));
+}
+
+/** 幂等地在 KPI 卡片上添加 LIVE 徽标和 realtime-active class。 */
+function _ensureLiveBadge(cardElement) {
+  cardElement.classList.add("realtime-active");
+  if (cardElement.querySelector(".live-badge")) {
+    return;
+  }
+  const badge = document.createElement("span");
+  badge.className = "live-badge";
+  const dot = document.createElement("span");
+  dot.className = "live-dot";
+  badge.appendChild(dot);
+  badge.appendChild(document.createTextNode("LIVE"));
+  const h3 = cardElement.querySelector("h3");
+  if (h3) {
+    h3.insertAdjacentElement("afterend", badge);
+  }
+}
+
+/** 清除所有 LIVE 徽标和 realtime-active class。 */
+function _removeLiveBadges() {
+  document.querySelectorAll(".kpi-card.realtime-active").forEach(function (el) {
+    el.classList.remove("realtime-active");
+  });
+  document.querySelectorAll(".live-badge").forEach(function (el) {
+    if (el.parentNode) {
+      el.parentNode.removeChild(el);
+    }
+  });
+}
+
+/** 用实时快照的 proposeGwei 覆盖 Gas KPI 卡片内容，并添加 LIVE 徽标。 */
+function _overlayRealtimeKpiOnGasCard() {
+  const snapshot = appState.realtimeSnapshot;
+  if (!snapshot || !snapshot.gasOracle) {
+    return;
+  }
+
+  const gasValueNode = document.getElementById("kpiAvgGas");
+  const gasChangeNode = document.getElementById("kpiAvgGasChange");
+  if (!gasValueNode || !gasChangeNode) {
+    return;
+  }
+
+  const gasCard = gasValueNode.closest(".kpi-card");
+  if (gasCard) {
+    const h3 = gasCard.querySelector("h3");
+    if (h3) {
+      h3.textContent = t("kpi_realtime_gas");
+    }
+    _ensureLiveBadge(gasCard);
+  }
+
+  const proposeGwei = snapshot.gasOracle.proposeGwei;
+  gasValueNode.textContent = proposeGwei != null
+    ? formatDecimal(proposeGwei, 1) + " Gwei"
+    : "--";
+
+  const safeGwei = snapshot.gasOracle.safeGwei;
+  const fastGwei = snapshot.gasOracle.fastGwei;
+  if (safeGwei != null && fastGwei != null) {
+    gasChangeNode.innerHTML = tFormat("kpi_realtime_gas_range", {
+      safe: formatDecimal(safeGwei, 1),
+      fast: formatDecimal(fastGwei, 1)
+    });
+  } else {
+    gasChangeNode.textContent = "";
+  }
+}
+
+/** 启动 API 模式下 15 分钟全量数据自动刷新定时器（与 Flask 文件缓存 TTL 对齐）。 */
+function startRealtimeAutoRefresh() {
+  stopRealtimeAutoRefresh();
+  appState._autoRefreshTimer = window.setInterval(function () {
+    if (appState.dataMode !== "api") {
+      stopRealtimeAutoRefresh();
+      return;
+    }
+    reloadDashboardData();
+  }, APP_CONFIG.rpcAutoRefreshMs);
+}
+
+/** 停止 KPI 自动刷新定时器并清除句柄。 */
+function stopRealtimeAutoRefresh() {
+  if (appState._autoRefreshTimer != null) {
+    window.clearInterval(appState._autoRefreshTimer);
+    appState._autoRefreshTimer = null;
+  }
+}
+
+/** 切换数据模式（"csv" | "api"），协调状态、渲染与定时器。 */
+async function switchDataMode(mode) {
+  if (mode === appState.dataMode) {
+    return;
+  }
+  appState.dataMode = mode;
+
+  if (mode === "csv") {
+    stopRealtimeAutoRefresh();
+    _removeLiveBadges();
+    await reloadDashboardData();
+    return;
+  }
+
+  // api 模式：从 Flask RPC 服务拉取全量实时数据
+  showToast(t("rpc_loading_hint"), "success");
+  await reloadDashboardData();
+  startRealtimeAutoRefresh();
+}
+
+/** 更新数据源下拉框选项文案（语言切换时调用）。 */
+function updateDataModeOptions() {
+  const dataModeSelect = document.getElementById("dataModeSelect");
+  if (!dataModeSelect) {
+    return;
+  }
+  dataModeSelect.options[0].textContent = t("datasource_csv");
+  dataModeSelect.options[1].textContent = t("datasource_api");
+}
+
 /** 触发后端刷新任务：下载主网最新 CSV 并覆盖本地离线文件。 */
 async function triggerOfflineCsvRefresh() {
   const payload = {
@@ -924,8 +1199,18 @@ function renderLabeledValueWithColor(node, templateKey, valueText, signValue) {
   node.innerHTML = t(templateKey).replace("{value}", valueHtml);
 }
 
-/** 渲染顶部 KPI 卡片内容。 */
+/** 渲染顶部 KPI 卡片内容；api 模式时对全部卡片贴 LIVE 徽标。 */
 function renderKpiCards(dataset) {
+  _renderKpiCardsFromCsv(dataset);
+  if (appState.dataMode === "api") {
+    document.querySelectorAll(".kpi-card").forEach(function (card) {
+      _ensureLiveBadge(card);
+    });
+  }
+}
+
+/** 用 CSV 数据渲染全部 KPI 卡片，逻辑与原 renderKpiCards 完全相同。 */
+function _renderKpiCardsFromCsv(dataset) {
   const overview = dataset.overview;
   const activeValueNode = document.getElementById("kpiActiveAddresses");
   const activeChangeNode = document.getElementById("kpiActiveAddressesChange");
@@ -1337,8 +1622,12 @@ function renderDataSourceBadge(source) {
   const badge = document.getElementById("dataSourceBadge");
   badge.classList.remove("csv");
   badge.classList.remove("mock");
+  badge.classList.remove("api");
 
-  if (source === "csv") {
+  if (source === "api") {
+    badge.classList.add("api");
+    badge.textContent = t("badge_realtime");
+  } else if (source === "csv") {
     badge.classList.add("csv");
     badge.textContent = t("badge_csv");
   } else {
@@ -1350,7 +1639,9 @@ function renderDataSourceBadge(source) {
 /** 更新头部的最后更新时间与回退提示信息。 */
 function renderHeaderMeta() {
   const metaNode = document.getElementById("lastUpdatedText");
-  const sourceText = appState.dataSource === "csv" ? t("source_csv") : t("source_mock");
+  const isApiMode = appState.dataMode === "api";
+  const sourceText = isApiMode ? t("source_rpc")
+    : appState.dataSource === "csv" ? t("source_csv") : t("source_mock");
   const header = tFormat("header_last_updated", {
     time: formatLocalTime(appState.lastUpdated || new Date().toISOString()),
     source: sourceText
@@ -1358,7 +1649,7 @@ function renderHeaderMeta() {
 
   if (appState.lastError) {
     metaNode.textContent = header + " | " + tFormat("header_error", { message: appState.lastError });
-  } else if (appState.dataSource === "mock") {
+  } else if (appState.dataSource === "mock" && !isApiMode) {
     metaNode.textContent = header + " | " + t("header_fallback");
   } else {
     metaNode.textContent = header;
@@ -1390,26 +1681,33 @@ function renderDashboard() {
   renderKpiCards(appState.dataset);
   renderWhaleTable(appState.dataset.whaleRanking);
   renderCharts(appState.dataset);
-  renderDataSourceBadge(appState.dataSource);
+  const badgeSource = appState.dataMode === "api" ? "api" : appState.dataSource;
+  renderDataSourceBadge(badgeSource);
   renderHeaderMeta();
   renderDatasetFileHints();
 }
 
-/** 加载并刷新当前窗口期数据。 */
+/** 加载并刷新当前窗口期数据；api 模式从 Flask RPC 服务取数。 */
 async function reloadDashboardData() {
-  setRefreshLoadingState(true, "button_refresh_loading");
+  const loadingKey = appState.dataMode === "api"
+    ? "button_refresh_loading_rpc"
+    : "button_refresh_loading";
+  setRefreshLoadingState(true, loadingKey);
   try {
-    const result = await loadDashboardDataset();
+    const result = appState.dataMode === "api"
+      ? await loadApiDataset()
+      : await loadDashboardDataset();
     appState.dataset = result.dataset;
     appState.dataSource = result.source;
     appState.lastUpdated = appState.dataset.meta.generatedAt || new Date().toISOString();
-    appState.lastError = result.error;
+    appState.lastError = result.error || "";
     renderDashboard();
   } catch (error) {
     appState.lastError = error && error.message ? error.message : "Unknown error";
     if (appState.dataset) {
       renderHeaderMeta();
-      renderDataSourceBadge(appState.dataSource || "csv");
+      const badgeSource = appState.dataMode === "api" ? "api" : (appState.dataSource || "csv");
+      renderDataSourceBadge(badgeSource);
       renderDatasetFileHints();
     } else {
       const metaNode = document.getElementById("lastUpdatedText");
@@ -1467,6 +1765,7 @@ function switchLanguage(language) {
   appState.language = language;
   applyStaticTranslations();
   updateNetworkOptions();
+  updateDataModeOptions();
   renderDatasetFileHints();
   if (appState.dataset) {
     renderDashboard();
@@ -1498,6 +1797,13 @@ function bindEvents() {
     refreshCsvFromMainnetAndReload();
   });
 
+  const dataModeSelect = document.getElementById("dataModeSelect");
+  if (dataModeSelect) {
+    dataModeSelect.addEventListener("change", function () {
+      switchDataMode(dataModeSelect.value === "api" ? "api" : "csv");
+    });
+  }
+
   window.addEventListener("resize", function () {
     Object.keys(chartInstances).forEach(function (key) {
       if (chartInstances[key]) {
@@ -1512,6 +1818,10 @@ function initControls() {
   document.getElementById("languageSelect").value = appState.language;
   document.getElementById("timeRangeSelect").value = String(appState.rangeDays);
   document.getElementById("networkSelect").value = appState.network;
+  const dataModeSelect = document.getElementById("dataModeSelect");
+  if (dataModeSelect) {
+    dataModeSelect.value = appState.dataMode;
+  }
 }
 
 /** 应用启动入口：初始化控件、图表、事件并加载首屏数据。 */
